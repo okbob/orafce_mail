@@ -1,0 +1,4 @@
+comment = 'Functions and operators that emulate API of utl_mail, dbms_mail and utl_smtp packages'
+default_version = '1.0'
+module_pathname = '$libdir/utl_mail'
+relocatable = false
