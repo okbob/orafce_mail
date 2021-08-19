@@ -15,7 +15,7 @@ run the following commands the adminpack source directory:
 make
 make install
 
-CREATE EXTENSION utl_mail;
+CREATE EXTENSION orafce_mail;
 
 Other administration tools that use this module may have different requirements,
 please consult the tool's documentation for further details.

@@ -1,14 +1,20 @@
-# $PostgreSQL: pgsql/contrib/plpgsql_check/Makefile
+# $PostgreSQL: pgsql/contrib/orafce_mail/Makefile
 
-MODULE_big = utl_mail
-OBJS = utl_mail.o
-DATA = utl_mail--1.0.sql
-EXTENSION = utl_mail
+MODULE_big = orafce_mail
+OBJS = orafce_mail.o
+DATA = orafce_mail--1.0.sql
+EXTENSION = orafce_mail
 
-REGRESS = init utl_mail
+REGRESS = init orafce_mail
+
+CURL_CONFIG = curl-config
+
+CFLAGS += $(shell $(CURL_CONFIG) --cflags)
+LIBS += $(shell $(CURL_CONFIG) --libs)
+SHLIB_LINK := $(LIBS)
 
 ifdef NO_PGXS
-subdir = contrib/utl_mail
+subdir = contrib/orafce_mail
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

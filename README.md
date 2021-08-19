@@ -1,8 +1,8 @@
-[![Build Status](https://travis-ci.org/okbob/dbms_sql.svg?branch=master)](https://travis-ci.org/okbob/utl_mail)
+[![Build Status](https://travis-ci.org/okbob/orafce_utl_mail.svg?branch=master)](https://travis-ci.org/okbob/orafce_utl_mail)
 
-# UTL_MAIL
+# orafce_mail
 
-This is implementation of Oracle's API of packages UTL_MAIL, DBMS_MAIL and UTL_SMTP
+This is implementation of Oracle's API of packages utl_mail, DBMS_MAIL
 
 It doesn't ensure full compatibility, but should to decrease a work necessary for
 successful migration.
@@ -14,5 +14,4 @@ successful migration.
 
 This extensions uses curl library.
 
-When you plan to use utl_mail extension together with Orafce, then you have to remove line
-with `CREATE DOMAIN varchar2 AS text;` statement from install sql script.
+An extension Orafce should be installed before
