@@ -10,6 +10,17 @@ language: C
 dist: xenial
 sudo: required
 
+addons:
+  apt:
+    packages:
+    - curl
+    - libcurl4-gnutls-dev
+    - ca-certificates
+    - software-properties-common 
+    - python-software-properties
+    - gnupg-curl
+
+
 before_install:
   - sudo apt-get update -qq
 
