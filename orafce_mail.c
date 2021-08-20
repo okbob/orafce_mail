@@ -1,13 +1,18 @@
-#include "postgres.h"
-#include "fmgr.h"
-#include "funcapi.h"
-#include "utils/builtins.h"
 
 #include <curl/curl.h>
-#include <mb/pg_wchar.h>
 #include <signal.h>
 #include <string.h>
-#include <utils/guc.h>
+
+#include "postgres.h"
+
+#include "fmgr.h"
+#include "funcapi.h"
+#include "mb/pg_wchar.h"
+#include "miscadmin.h"
+#include "utils/acl.h"
+#include "utils/builtins.h"
+#include "utils/elog.h"
+#include "utils/guc.h"
 
 PG_MODULE_MAGIC;
 
@@ -19,19 +24,44 @@ PG_FUNCTION_INFO_V1(orafce_mail_dbms_mail_send);
 void _PG_init(void);
 void _PG_fini(void);
 
-typedef struct
-{
-	char	    *data;
-	size_t		size;
-	size_t		used;
-} DynBuffer;
+Oid		ORAFCE_MAIL_ROLE_USE = InvalidOid;
+Oid		ORAFCE_MAIL_ROLE_CONFIG_URL = InvalidOid;
+Oid		ORAFCE_MAIL_ROLE_CONFIG_USERPWD = InvalidOid;
+
+
+/*
+
+    CREATE ROLE orafce_mail NOLOGIN;
+  END IF;
+  IF NOT EXISTS(SELECT * FROM pg_roles WHERE rolname = 'orafce_mail_config_url') THEN
+    CREATE ROLE orafce_mail_config_url NOLOGIN;
+  END IF;
+  IF NOT EXISTS(SELECT * FROM pg_roles WHERE rolname = 'orafce_mail_config_userpwd') THEN
+    CREATE ROLE orafce_mail_config_userpwd NOLOGIN;
+  END IF;
+
+*/
 
 typedef struct
 {
-	char	   *ptr;
+	char	   *header_data;
+	size_t		header_size;
+	size_t		header_position;
+
+	char	   *data;
 	size_t		size;
-	size_t		processed;
-} StringReader;
+	size_t		position;
+
+	bool		unix2dos_nl;
+
+} BinaryReader;
+
+typedef struct
+{
+	char	   *data;
+	size_t		size;
+	size_t		used;
+} DynamicBuffer;
 
 /*
  * Invisible super user settings
@@ -47,6 +77,43 @@ char	   *orafce_smtp_userpwd = NULL;
 
 pqsigfunc pgsql_interrupt_handler = NULL;
 int interrupt_requested = 0;
+
+static bool
+check_priv_of_role(Oid *oidptr, char *rolname)
+{
+	if (!OidIsValid(*oidptr))
+		*oidptr = get_role_oid(rolname, false);
+
+	return has_privs_of_role(GetUserId(), *oidptr);
+	//ACL_ID_PUBLIC
+}
+
+
+static void
+add_line(DynamicBuffer *dbuf, char *str)
+{
+	size_t		len = strlen(str);
+	char	   *write_ptr;
+
+	if (dbuf->used + len + 3 > dbuf->size)
+	{
+		size_t	new_size = ((dbuf->used + len + 1024) / 1024 + 1) * 1024;
+
+		if (dbuf->size == 0)
+			dbuf->data = palloc(new_size);
+		else
+			dbuf->data = repalloc(dbuf->data, new_size);
+
+		dbuf->size = new_size;
+	}
+
+	write_ptr = dbuf->data + dbuf->used;
+
+	memcpy(write_ptr, str, len);
+	memcpy(write_ptr + len, "\r\n\0", 3);
+
+	dbuf->used += len + 2;
+}
 
 /*
 * To support request interruption, we have libcurl run the progress meter
@@ -155,6 +222,61 @@ not_null_not_empty_arg(FunctionCallInfo fcinfo, int argno, const char *fcname, c
 }
 
 /*
+ * CURL list is linked list of duplicated strings. This routine
+ * does formatting of one row of header and add this row to list.
+ *
+ */
+static struct curl_slist *
+add_header_item(struct curl_slist *sl, DynamicBuffer *dbuf, const char *fieldname, const char *arg)
+{
+	char	   *buf, *ptr;
+
+	if (!arg)
+		return sl;
+
+	buf = malloc(strlen(fieldname) + strlen(arg) + 2);
+	if (!buf)
+		elog(ERROR, "out of memory");
+
+	ptr = buf;
+	while (*fieldname)
+		*ptr++ = *fieldname++;
+
+	while (*arg)
+		*ptr++ = *arg++;
+
+	*ptr = '\0';
+
+	if (dbuf)
+	{
+		add_line(dbuf, buf);
+	}
+	else
+	{
+		sl = curl_slist_append(sl, buf);
+		if (!sl)
+			elog(ERROR, "out of memory");
+	}
+
+	free(buf);
+
+	return sl;
+}
+
+static struct curl_slist *
+add_header_priority_item(struct curl_slist *sl, DynamicBuffer *dbuf, int priority, bool isnull)
+{
+	char	buffer[100];
+
+	if (isnull)
+		return sl;
+
+	snprintf(buffer, sizeof(buffer), "%d", priority);
+
+	return add_header_item(sl, dbuf, "X-Priority: ", buffer);
+}
+
+/*
  * Parse string as comma delimited list.
  *
  * Attention, this function modifies input string.
@@ -171,117 +293,143 @@ add_fields(struct curl_slist *sl, char *str)
 	while (tok)
 	{
 		sl = curl_slist_append(sl, tok);
+		if (!sl)
+			elog(ERROR, "out of memory");
+
 		tok = strtok(NULL, ",");
 	}
 
 	return sl;
 }
 
-static void
-dynbuf_add_bytes(DynBuffer *buf, const char *str, size_t bytes)
-{
-	if (str && *str && bytes > 0)
-	{
-		if (bytes + 1 > (buf->size - buf->used))
-		{
-			size_t		newsize = (((buf->used + bytes + 1024) / 1024) + 1) * 1024;
-
-			if (buf->data)
-				buf->data = repalloc(buf->data, newsize);
-			else
-				buf->data = palloc(newsize);
-
-			buf->size = newsize;
-		}
-
-		memcpy(buf->data + buf->used, str, bytes);
-		buf->used += bytes;
-		buf->data[buf->used] = '\0';
-	}
-}
-
-static void
-dynbuf_add_string(DynBuffer *buf, const char *str)
-{
-	if (str && *str)
-		dynbuf_add_bytes(buf, str, strlen(str));
-}
-
-static void
-dynbuf_add_fields(DynBuffer *buf, const char *fieldname, char *strlist)
-{
-	char	   *tok;
-
-	if (strlist)
-	{
-		tok = strtok(strlist, ",");
-		while ((tok))
-		{
-			dynbuf_add_string(buf, fieldname);
-			dynbuf_add_string(buf, tok);
-			dynbuf_add_string(buf, "\r\n");
-
-			tok = strtok(NULL, ",");
-		}
-	}
-}
-
-static void
-dynbuf_add_field(DynBuffer *buf, const char *fieldname, char *str)
-{
-	if (str)
-	{
-		dynbuf_add_string(buf, fieldname);
-		dynbuf_add_string(buf, str);
-		dynbuf_add_string(buf, "\r\n");
-	}
-}
-
-static void
-dynbuf_add_lines(DynBuffer *buf, const char *str)
-{
-	while (str && *str)
-	{
-		const char	   *ptr = str;
-
-		while (*ptr && *ptr != '\r' && *ptr != '\n')
-			ptr += 1;
-
-		dynbuf_add_bytes(buf, str, ptr - str);
-		dynbuf_add_bytes(buf, "\r\n", 2);
-
-		if (*ptr == '\0')
-			break;
-
-		if (ptr[0] == '\r' && ptr[1] == '\n')
-			str = ptr + 2;
-
-		if (*ptr == '\r' || *ptr == '\n')
-			str = ptr + 1;
-	}
-}
-
-
 static size_t
 read_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
-	StringReader *sreader = (StringReader *) userdata;
-	size_t not_processed_yet = sreader->size - sreader->processed;
-	size_t read_bytes = size * nmemb;
+	BinaryReader *reader = (BinaryReader *) userdata;
+	size_t not_processed_yet;
+	size_t write_buffer_size = size * nmemb;
 
-	if ((size == 0) || (nmemb == 0) || ((size*nmemb) < 1))
+	if ((size == 0) ||
+		(nmemb == 0) ||
+		((size * nmemb) < 1))
 		return 0;
 
-	if (read_bytes > not_processed_yet)
-		read_bytes = not_processed_yet;
-
-	if (read_bytes > 0)
+	/*
+	 * When we have to send header's lines first
+	 */
+	not_processed_yet = reader->header_size - reader->header_position;
+	if (reader->header_size > reader->header_position)
 	{
-		memcpy(ptr, sreader->ptr, read_bytes);
-		sreader->processed += read_bytes;
+		char	   *read_buffer = reader->header_data + reader->header_position;
+
+		if (write_buffer_size > not_processed_yet)
+			write_buffer_size = not_processed_yet;
+
+		memcpy(ptr, read_buffer, write_buffer_size);
+		reader->header_position += write_buffer_size;
+
+		return write_buffer_size;
 	}
 
-	return read_bytes;
+	/*
+	 * Header was processed, now print empty line as separator
+	 */
+	if (reader->header_size > 0)
+	{
+		memcpy(ptr, "\r\n", 2);
+		reader->header_size = 0;
+		reader->header_position = 0;
+
+		return 2;
+	}
+
+	/*
+	 * Now, send data.
+	 */
+	not_processed_yet = reader->size - reader->position;
+	if (not_processed_yet > 0)
+	{
+		char	   *write_buffer = ptr;
+		char	   *read_buffer = reader->data + reader->position;
+		char	   *rptr = read_buffer;
+
+		if (!reader->unix2dos_nl)
+		{
+			if (write_buffer_size > not_processed_yet)
+				write_buffer_size = not_processed_yet;
+
+			memcpy(write_buffer, read_buffer, write_buffer_size);
+			reader->position += write_buffer_size;
+
+			return write_buffer_size;
+		}
+
+		while (not_processed_yet > 0 && write_buffer_size > 0)
+		{
+			if ((not_processed_yet > 1) &&
+				(rptr[0] == '\r' && rptr[1] == '\n'))
+			{
+				if (write_buffer_size >= 2)
+				{
+					*ptr++ = *rptr++;
+					*ptr++ = *rptr++;
+					write_buffer_size -= 2;
+					not_processed_yet -= 2;
+				}
+				else
+					break;
+			}
+
+			if (rptr[0] == '\n')
+			{
+				if (write_buffer_size >= 2)
+				{
+					*ptr++ = '\r';
+					*ptr++ = *rptr++;
+					write_buffer_size -= 2;
+					not_processed_yet -= 1;
+				}
+				else
+					break;
+			}
+			else
+			{
+				*ptr++ = *rptr++;
+				write_buffer_size -= 1;
+				not_processed_yet -= 1;
+			}
+		}
+
+		reader->position += rptr - read_buffer;
+
+		return ptr - write_buffer;
+	}
+
+	return 0;
+}
+
+static int
+seek_callback(void *arg, curl_off_t offset, int origin)
+{
+	BinaryReader *p = (BinaryReader *) arg;
+
+	switch(origin)
+	{
+		case SEEK_END:
+			offset += p->size;
+			break;
+
+		case SEEK_CUR:
+			offset += p->position;
+			break;
+	}
+
+	if(offset < 0)
+		return CURL_SEEKFUNC_FAIL;
+
+	p->position = offset;
+
+	return CURL_SEEKFUNC_OK;
 }
 
 static void
@@ -289,6 +437,280 @@ OOM_CHECK(CURLcode res)
 {
 	if (res == (CURLcode) CURLM_OUT_OF_MEMORY)
 		elog(ERROR, "out of memory");
+}
+
+static void
+CHECK_OK(CURLcode res)
+{
+	if (res != CURLE_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+				 errmsg("curl_easy_setopt fails"),
+				 errdetail("%s", curl_easy_strerror(res))));
+}
+
+static void
+orafce_send_mail(char *sender,
+				 char *recipients,
+				 char *cc,
+				 char *bcc,
+				 char *subject,
+				 char *replyto,
+				 int priority,
+				 bool priority_is_null,
+				 char *message,
+				 char *mime_type,
+				 char *attachment_data,
+				 size_t attachment_size,
+				 char *att_mime_type,
+				 char *att_filename,
+				 bool att_is_text)
+{
+	CURL	   *curl;
+	char		charbuffer[1024];
+
+	if (!check_priv_of_role(&ORAFCE_MAIL_ROLE_USE, "orafce_mail"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be a member of the role \"orafce_mail\"")));
+
+	if (!orafce_smtp_url)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("orafce.smtp_url is not specified"),
+				 errdetail("The address (url) of smtp service is not known.")));
+
+	curl = curl_easy_init();
+	if (curl)
+	{
+		CURLcode	res;
+		struct curl_slist *recip = NULL;
+		struct curl_slist *headers = NULL;
+		curl_mime *mime = NULL;
+		curl_mimepart *part;
+		BinaryReader reader;
+		BinaryReader message_reader;
+		DynamicBuffer dbuf, *_dbuf;
+
+		memset(&message_reader, 0, sizeof(BinaryReader));
+		memset(&reader, 0, sizeof(BinaryReader));
+
+		PG_TRY();
+		{
+			OOM_CHECK(curl_easy_setopt(curl, CURLOPT_URL, orafce_smtp_url));
+
+			if (orafce_smtp_userpwd)
+				OOM_CHECK(curl_easy_setopt(curl, CURLOPT_USERPWD, orafce_smtp_userpwd));
+
+			if (strncmp(orafce_smtp_url, "smtps://", 8) == 0)
+				(void) curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_ALL);
+
+			(void) curl_easy_setopt(curl, CURLOPT_MAIL_RCPT_ALLLOWFAILS, 1L);
+
+			OOM_CHECK(curl_easy_setopt(curl, CURLOPT_MAIL_FROM, sender));
+
+			recip = add_fields(recip, recipients);
+
+			(void) curl_easy_setopt(curl, CURLOPT_MAIL_RCPT, recip);
+
+			/*
+			 * curl http header is working only when MIME is used. Without
+			 * MIME I have to collect headers in dynamic string.
+			 */
+			if (!attachment_data)
+			{
+				dbuf.data = NULL;
+				dbuf.size = 0;
+				dbuf.used = 0;
+				_dbuf = &dbuf;
+			}
+			else
+				_dbuf = NULL;
+
+			headers = add_header_item(headers, _dbuf, "From: ", sender);
+			headers = add_header_item(headers, _dbuf, "To: " , recipients);
+			headers = add_header_item(headers, _dbuf, "Cc: ", cc);
+			headers = add_header_item(headers, _dbuf, "Bcc: ", bcc);
+			headers = add_header_item(headers, _dbuf, "Reply-To: ", replyto);
+			headers = add_header_priority_item(headers, _dbuf, priority, priority_is_null);
+			headers = add_header_item(headers, _dbuf, "Subject: ", subject);
+
+			/*
+			 * When there are an attachment, then we make multipart mime
+			 */
+			if (attachment_data)
+			{
+				mime = curl_mime_init(curl);
+				if (!mime)
+					elog(ERROR, "out of memory");
+
+				if (message)
+				{
+					part = curl_mime_addpart(mime);
+					if (!part)
+						elog(ERROR, "out of memory");
+
+					if (!mime_type)
+					{
+						snprintf(charbuffer,
+								 sizeof(charbuffer),
+								 "text/plain; charset=\"%s\"",
+								 get_encoding_name_for_icu(pg_get_client_encoding()));
+
+						CHECK_OK(curl_mime_type(part, charbuffer));
+					}
+					else
+						CHECK_OK(curl_mime_type(part, mime_type));
+
+					message_reader.data = message;
+					message_reader.size = strlen(message);
+					message_reader.position = 0;
+
+					if (!mime_type || strncmp(mime_type, "text/plain;", 11) == 0)
+						message_reader.unix2dos_nl = true;
+					else
+						message_reader.unix2dos_nl = false;
+
+					(void) curl_mime_data_cb(part,
+											  -1,
+											  read_callback,
+											  NULL,
+											  NULL,
+											  &message_reader);
+
+					CHECK_OK(curl_mime_encoder(part, "8bit"));
+				}
+
+				part = curl_mime_addpart(mime);
+				if (!part)
+					elog(ERROR, "out of memory");
+
+				if (att_mime_type)
+					CHECK_OK(curl_mime_type(part, att_mime_type));
+				else
+				{
+					if (att_is_text)
+					{
+						snprintf(charbuffer,
+								 sizeof(charbuffer),
+								 "text/plain; charset=\"%s\"",
+								 get_encoding_name_for_icu(pg_get_client_encoding()));
+
+						CHECK_OK(curl_mime_type(part, charbuffer));
+					}
+					else
+						CHECK_OK(curl_mime_type(part, "application/octet"));
+				}
+
+				(void) curl_mime_encoder(part, "base64");
+
+				if (att_filename)
+				{
+					CHECK_OK(curl_mime_filename(part, att_filename));
+					CHECK_OK(curl_mime_name(part, att_filename));
+				}
+
+				reader.data = attachment_data;
+				reader.size = attachment_size;
+				reader.position = 0;
+
+				if (att_is_text &&
+					(!att_mime_type || strncmp(att_mime_type, "text/plain;", 11) == 0))
+					reader.unix2dos_nl = true;
+				else
+					reader.unix2dos_nl = false;
+
+				(void) curl_mime_data_cb(part,
+								  reader.unix2dos_nl ? (size_t) -1 : reader.size,
+								  read_callback,
+								  reader.unix2dos_nl ? NULL : seek_callback,
+								  NULL,
+								  &reader);
+
+				(void) curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+			}
+			else
+			{
+				if (!mime_type)
+				{
+					snprintf(charbuffer,
+							 sizeof(charbuffer),
+							 "text/plain; charset=\"%s\"",
+							 get_encoding_name_for_icu(pg_get_client_encoding()));
+
+					headers = add_header_item(headers, _dbuf, "Content-Type: ", charbuffer);
+				}
+				else
+					headers = add_header_item(headers, _dbuf, "Content-Type: ", mime_type);
+
+				headers = add_header_item(headers, _dbuf, "Content-Transfer-Encoding: ", "8bit");
+
+				message_reader.data = message;
+				message_reader.size = strlen(message);
+				message_reader.position = 0;
+
+				if (!mime_type || strncmp(mime_type, "text/plain;", 11) == 0)
+					message_reader.unix2dos_nl = true;
+				else
+					message_reader.unix2dos_nl = false;
+
+				CHECK_OK(curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback));
+				CHECK_OK(curl_easy_setopt(curl, CURLOPT_READDATA, &message_reader));
+				CHECK_OK(curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L));
+			}
+
+			if (headers)
+				CHECK_OK(curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers));
+			else
+			{
+				if (!_dbuf)
+					elog(ERROR, "dynamic buffer is NULL");
+
+				message_reader.header_data = _dbuf->data;
+				message_reader.header_size = _dbuf->used;
+				message_reader.header_position = 0;
+			}
+
+#if LIBCURL_VERSION_NUM >= 0x072700 /* 7.39.0 */
+
+			/* Connect the progress callback for interrupt support */
+			(void) curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
+			(void) curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0);
+
+#endif
+
+			res = curl_easy_perform(curl);
+
+			if (res != CURLE_OK)
+				ereport(ERROR,
+						(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+						 errmsg("cannot send mail"),
+						 errdetail("curl_easy_perform() failed: %s", curl_easy_strerror(res))));
+
+			if (_dbuf)
+				pfree(_dbuf->data);
+
+			curl_slist_free_all(recip);
+			curl_slist_free_all(headers);
+			curl_easy_cleanup(curl);
+			curl_mime_free(mime);
+		}
+		PG_CATCH();
+		{
+			if (_dbuf)
+				pfree(_dbuf->data);
+
+			curl_slist_free_all(recip);
+			curl_slist_free_all(headers);
+			curl_easy_cleanup(curl);
+			curl_mime_free(mime);
+
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+	else
+		elog(ERROR, "cannot to start libcurl");
 }
 
 /*
@@ -307,8 +729,6 @@ OOM_CHECK(CURLcode res)
 Datum
 orafce_mail_send(PG_FUNCTION_ARGS)
 {
-	CURL	   *curl;
-
 	char	   *sender;
 	char	   *recipients;
 	char	   *cc;
@@ -318,14 +738,14 @@ orafce_mail_send(PG_FUNCTION_ARGS)
 	char	   *mime_type;
 	volatile int priority = 0;
 	volatile bool priority_is_null = false;
-	char		mime_type_buffer[1024];
+	char	   *replyto;
 
-	sender = not_null_not_empty_arg(fcinfo, 0, "utl_mail.send", "sender");
-	recipients = not_null_not_empty_arg(fcinfo, 1, "utl_mail.send", "recipients");
+	sender = not_null_not_empty_arg(fcinfo, 0, "utl_mail.send_attach_raw", "sender");
+	recipients = not_null_not_empty_arg(fcinfo, 1, "utl_mail.send_attach_raw", "recipients");
 	cc = null_or_empty_arg(fcinfo, 2);
 	bcc = null_or_empty_arg(fcinfo, 3);
 	subject = null_or_empty_arg(fcinfo, 4);
-	message = not_null_not_empty_arg(fcinfo, 5, "utl_mail.send", "message");
+	message = null_or_empty_arg(fcinfo, 5);
 	mime_type = null_or_empty_arg(fcinfo, 6);
 
 	if (!PG_ARGISNULL(7))
@@ -333,112 +753,23 @@ orafce_mail_send(PG_FUNCTION_ARGS)
 	else
 		priority_is_null = true;
 
-	if (!orafce_smtp_url)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("orafce.smtp_url is not specified"),
-				 errdetail("The address (url) of smtp service is not known.")));
+	replyto = null_or_empty_arg(fcinfo, 8);
 
-	if (!mime_type)
-	{
-		snprintf(mime_type_buffer, sizeof(mime_type_buffer), "text/plain; charset=\"%s\"",
-				get_encoding_name_for_icu(pg_get_client_encoding()));
-		mime_type = mime_type_buffer;
-	}
-
-	curl = curl_easy_init();
-	if (curl)
-	{
-		CURLcode	res;
-		struct curl_slist *recip = NULL;
-		DynBuffer dbuf;
-		StringReader sreader;
-
-		PG_TRY();
-		{
-			OOM_CHECK(curl_easy_setopt(curl, CURLOPT_URL, orafce_smtp_url));
-
-			if (orafce_smtp_userpwd)
-				OOM_CHECK(curl_easy_setopt(curl, CURLOPT_USERPWD, orafce_smtp_userpwd));
-
-			if (strncmp(orafce_smtp_url, "smtps://", 8) == 0)
-				(void) curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_ALL);
-
-			(void) curl_easy_setopt(curl, CURLOPT_MAIL_RCPT_ALLLOWFAILS, 1L);
-
-			OOM_CHECK(curl_easy_setopt(curl, CURLOPT_MAIL_FROM, sender));
-
-			recip = add_fields(recip, recipients);
-
-			if (cc)
-				recip = add_fields(recip, pstrdup(cc));
-
-			if (bcc)
-				recip = add_fields(recip, pstrdup(bcc));
-
-			(void) curl_easy_setopt(curl, CURLOPT_MAIL_RCPT, recip);
-
-			dbuf.data = NULL;
-			dbuf.size = 0;
-			dbuf.used = 0;
-
-			dynbuf_add_fields(&dbuf, "To: ", recipients);
-			dynbuf_add_fields(&dbuf, "From: ", sender);
-			dynbuf_add_fields(&dbuf, "Cc: ", cc);
-			dynbuf_add_fields(&dbuf, "Bcc: ", bcc);
-
-			dynbuf_add_field(&dbuf, "Content-type: ", mime_type);
-
-			if (!priority_is_null)
-			{
-				char	buffer[10];
-
-				snprintf(buffer, 10, "%d", priority);
-				dynbuf_add_field(&dbuf, "X-Priority: ", buffer);
-			}
-
-			dynbuf_add_field(&dbuf, "Subject: ", subject);
-			dynbuf_add_string(&dbuf, "\r\n");
-			dynbuf_add_lines(&dbuf, message);
-
-			sreader.ptr = dbuf.data;
-			sreader.size = dbuf.used;
-			sreader.processed = 0;
-
-			(void) curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
-			(void) curl_easy_setopt(curl, CURLOPT_READDATA, &sreader);
-			(void) curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-
-#if LIBCURL_VERSION_NUM >= 0x072700 /* 7.39.0 */
-
-			/* Connect the progress callback for interrupt support */
-			(void) curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
-			(void) curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0);
-
-#endif
-
-			res = curl_easy_perform(curl);
-
-			if (res != CURLE_OK)
-				ereport(ERROR,
-						errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-						errmsg("cannot send mail"),
-						errdetail("curl_easy_perform() failed: %s", curl_easy_strerror(res)));
-
-			curl_slist_free_all(recip);
-			curl_easy_cleanup(curl);
-		}
-		PG_CATCH();
-		{
-			curl_slist_free_all(recip);
-			curl_easy_cleanup(curl);
-
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
-	else
-		elog(ERROR, "cannot to start libcurl");
+	orafce_send_mail(sender,
+					 recipients,
+					 cc,
+					 bcc,
+					 subject,
+					 replyto,
+					 priority,
+					 priority_is_null,
+					 message,
+					 mime_type,
+					 NULL,
+					 0,
+					 NULL,
+					 NULL,
+					 false);
 
 	return (Datum) 0;
 }
@@ -451,7 +782,7 @@ orafce_mail_send(PG_FUNCTION_ARGS)
  * 		bcc varchar2 DEFAULT NULL,
  * 		subject varchar2 DEFAULT NULL,
  * 		message varchar2
- * 		mime_type varchar2 DEFAULT 'text/plain; charset=us-ascii',
+ * 		mime_type varchar2 DEFAULT NULL,
  * 		priority integer DEFAULT NULL
  * 		attachment bytea,
  * 		att_inline boolean DEFAULT true,
@@ -462,8 +793,6 @@ orafce_mail_send(PG_FUNCTION_ARGS)
 Datum
 orafce_mail_send_attach_raw(PG_FUNCTION_ARGS)
 {
-	CURL	   *curl;
-
 	char	   *sender;
 	char	   *recipients;
 	char	   *cc;
@@ -472,15 +801,20 @@ orafce_mail_send_attach_raw(PG_FUNCTION_ARGS)
 	char	   *message;
 	char	   *mime_type;
 	volatile int priority = 0;
+	char	   *att_mime_type;
+	char	   *att_filename;
 	volatile bool priority_is_null = false;
-	char		mime_type_buffer[1024];
+	bytea	   *vlena;
+	char	   *attachment_data;
+	size_t		attachment_size;
+	char	   *replyto;
 
-	sender = not_null_not_empty_arg(fcinfo, 0, "utl_mail.send", "sender");
-	recipients = not_null_not_empty_arg(fcinfo, 1, "utl_mail.send", "recipients");
+	sender = not_null_not_empty_arg(fcinfo, 0, "utl_mail.send_attach_raw", "sender");
+	recipients = not_null_not_empty_arg(fcinfo, 1, "utl_mail.send_attach_raw", "recipients");
 	cc = null_or_empty_arg(fcinfo, 2);
 	bcc = null_or_empty_arg(fcinfo, 3);
 	subject = null_or_empty_arg(fcinfo, 4);
-	message = not_null_not_empty_arg(fcinfo, 5, "utl_mail.send", "message");
+	message = null_or_empty_arg(fcinfo, 5);
 	mime_type = null_or_empty_arg(fcinfo, 6);
 
 	if (!PG_ARGISNULL(7))
@@ -488,116 +822,32 @@ orafce_mail_send_attach_raw(PG_FUNCTION_ARGS)
 	else
 		priority_is_null = true;
 
-	if (!orafce_smtp_url)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("orafce.smtp_url is not specified"),
-				 errdetail("The address (url) of smtp service is not known.")));
+	vlena = DatumGetByteaPP(not_null_arg(fcinfo, 8, "utl_mail.send_attach_raw", "attachment"));
+	attachment_data = VARDATA_ANY(vlena);
+	attachment_size = (size_t) VARSIZE_ANY_EXHDR(vlena);
 
-	if (!mime_type)
-	{
-		snprintf(mime_type_buffer, sizeof(mime_type_buffer), "text/plain; charset=\"%s\"",
-				get_encoding_name_for_icu(pg_get_client_encoding()));
-		mime_type = mime_type_buffer;
-	}
+	att_mime_type = null_or_empty_arg(fcinfo, 10);
+	att_filename = null_or_empty_arg(fcinfo, 11);
 
-	curl = curl_easy_init();
-	if (curl)
-	{
-		CURLcode	res;
-		struct curl_slist *recip = NULL;
-		DynBuffer dbuf;
-		StringReader sreader;
+	replyto = null_or_empty_arg(fcinfo, 12);
 
-		PG_TRY();
-		{
-			OOM_CHECK(curl_easy_setopt(curl, CURLOPT_URL, orafce_smtp_url));
-
-			if (orafce_smtp_userpwd)
-				OOM_CHECK(curl_easy_setopt(curl, CURLOPT_USERPWD, orafce_smtp_userpwd));
-
-			if (strncmp(orafce_smtp_url, "smtps://", 8) == 0)
-				(void) curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_ALL);
-
-			(void) curl_easy_setopt(curl, CURLOPT_MAIL_RCPT_ALLLOWFAILS, 1L);
-
-			OOM_CHECK(curl_easy_setopt(curl, CURLOPT_MAIL_FROM, sender));
-
-			recip = add_fields(recip, recipients);
-
-			if (cc)
-				recip = add_fields(recip, pstrdup(cc));
-
-			if (bcc)
-				recip = add_fields(recip, pstrdup(bcc));
-
-			(void) curl_easy_setopt(curl, CURLOPT_MAIL_RCPT, recip);
-
-			dbuf.data = NULL;
-			dbuf.size = 0;
-			dbuf.used = 0;
-
-			dynbuf_add_fields(&dbuf, "To: ", recipients);
-			dynbuf_add_fields(&dbuf, "From: ", sender);
-			dynbuf_add_fields(&dbuf, "Cc: ", cc);
-			dynbuf_add_fields(&dbuf, "Bcc: ", bcc);
-
-			dynbuf_add_field(&dbuf, "Content-type: ", mime_type);
-
-			if (!priority_is_null)
-			{
-				char	buffer[10];
-
-				snprintf(buffer, 10, "%d", priority);
-				dynbuf_add_field(&dbuf, "X-Priority: ", buffer);
-			}
-
-			dynbuf_add_field(&dbuf, "Subject: ", subject);
-			dynbuf_add_string(&dbuf, "\r\n");
-			dynbuf_add_lines(&dbuf, message);
-
-			sreader.ptr = dbuf.data;
-			sreader.size = dbuf.used;
-			sreader.processed = 0;
-
-			(void) curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
-			(void) curl_easy_setopt(curl, CURLOPT_READDATA, &sreader);
-			(void) curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-
-#if LIBCURL_VERSION_NUM >= 0x072700 /* 7.39.0 */
-
-			/* Connect the progress callback for interrupt support */
-			(void) curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
-			(void) curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0);
-
-#endif
-
-			res = curl_easy_perform(curl);
-
-			if (res != CURLE_OK)
-				ereport(ERROR,
-						errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-						errmsg("cannot send mail"),
-						errdetail("curl_easy_perform() failed: %s", curl_easy_strerror(res)));
-
-			curl_slist_free_all(recip);
-			curl_easy_cleanup(curl);
-		}
-		PG_CATCH();
-		{
-			curl_slist_free_all(recip);
-			curl_easy_cleanup(curl);
-
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
-	else
-		elog(ERROR, "cannot to start libcurl");
+	orafce_send_mail(sender,
+					 recipients,
+					 cc,
+					 bcc,
+					 subject,
+					 replyto,
+					 priority,
+					 priority_is_null,
+					 message,
+					 mime_type,
+					 attachment_data,
+					 attachment_size,
+					 att_mime_type,
+					 att_filename,
+					 false);
 
 	return (Datum) 0;
-
-
 }
 
 /*
@@ -619,9 +869,59 @@ orafce_mail_send_attach_raw(PG_FUNCTION_ARGS)
 Datum
 orafce_mail_send_attach_varchar2(PG_FUNCTION_ARGS)
 {
-	char	   *sender = text_to_cstring(PG_GETARG_TEXT_P(0));
+	char	   *sender;
+	char	   *recipients;
+	char	   *cc;
+	char	   *bcc;
+	char	   *subject;
+	char	   *message;
+	char	   *mime_type;
+	volatile int priority = 0;
+	char	   *att_mime_type;
+	char	   *att_filename;
+	volatile bool priority_is_null = false;
+	bytea	   *vlena;
+	char	   *attachment_data;
+	size_t		attachment_size;
+	char	   *replyto;
 
-	(void) sender;
+	sender = not_null_not_empty_arg(fcinfo, 0, "utl_mail.send_attach_varchar2", "sender");
+	recipients = not_null_not_empty_arg(fcinfo, 1, "utl_mail.send_attach_varchar2", "recipients");
+	cc = null_or_empty_arg(fcinfo, 2);
+	bcc = null_or_empty_arg(fcinfo, 3);
+	subject = null_or_empty_arg(fcinfo, 4);
+	message = null_or_empty_arg(fcinfo, 5);
+	mime_type = null_or_empty_arg(fcinfo, 6);
+
+	if (!PG_ARGISNULL(7))
+		priority = PG_GETARG_INT32(7);
+	else
+		priority_is_null = true;
+
+	vlena = DatumGetByteaPP(not_null_arg(fcinfo, 8, "utl_mail.send_attach_varchar2", "attachment"));
+	attachment_data = VARDATA_ANY(vlena);
+	attachment_size = (size_t) VARSIZE_ANY_EXHDR(vlena);
+
+	att_mime_type = null_or_empty_arg(fcinfo, 10);
+	att_filename = null_or_empty_arg(fcinfo, 11);
+
+	replyto = null_or_empty_arg(fcinfo, 12);
+
+	orafce_send_mail(sender,
+					 recipients,
+					 cc,
+					 bcc,
+					 subject,
+					 replyto,
+					 priority,
+					 priority_is_null,
+					 message,
+					 mime_type,
+					 attachment_data,
+					 attachment_size,
+					 att_mime_type,
+					 att_filename,
+					 true);
 
 	return (Datum) 0;
 }
@@ -640,9 +940,37 @@ orafce_mail_send_attach_varchar2(PG_FUNCTION_ARGS)
 Datum
 orafce_mail_dbms_mail_send(PG_FUNCTION_ARGS)
 {
-	char	   *sender = text_to_cstring(PG_GETARG_TEXT_P(0));
+	char	   *sender;
+	char	   *recipients;
+	char	   *cc;
+	char	   *bcc;
+	char	   *subject;
+	char	   *message;
+	char	   *replyto;
 
-	(void) sender;
+	sender = not_null_not_empty_arg(fcinfo, 0, "dbms_mail.send", "from_str");
+	recipients = not_null_not_empty_arg(fcinfo, 1, "dbms_mail.send", "to_str");
+	cc = null_or_empty_arg(fcinfo, 2);
+	bcc = null_or_empty_arg(fcinfo, 3);
+	subject = null_or_empty_arg(fcinfo, 4);
+	replyto = null_or_empty_arg(fcinfo, 5);
+	message = null_or_empty_arg(fcinfo, 6);
+
+	orafce_send_mail(sender,
+					 recipients,
+					 cc,
+					 bcc,
+					 subject,
+					 replyto,
+					 0,
+					 true,
+					 message,
+					 NULL,
+					 NULL,
+					 0,
+					 NULL,
+					 NULL,
+					 false);
 
 	return (Datum) 0;
 }
@@ -692,8 +1020,10 @@ _PG_fini(void)
 {
 
 #if LIBCURL_VERSION_NUM >= 0x072700
+
 	/* Re-register the original signal handler */
 	pqsignal(SIGINT, pgsql_interrupt_handler);
+
 #endif
 
 	curl_global_cleanup();

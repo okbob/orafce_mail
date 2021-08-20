@@ -5,6 +5,9 @@
 CREATE SCHEMA utl_mail;
 CREATE SCHEMA dbms_mail;
 
+GRANT USAGE ON SCHEMA utl_mail TO PUBLIC;
+GRANT USAGE ON SCHEMA dbms_mail TO PUBLIC;
+
 CREATE PROCEDURE utl_mail.send(
 	sender varchar2,
 	recipients varchar2,
@@ -13,7 +16,8 @@ CREATE PROCEDURE utl_mail.send(
 	subject varchar2 DEFAULT NULL,
 	message varchar2 DEFAULT NULL,
 	mime_type varchar2 DEFAULT NULL,
-	priority integer DEFAULT NULL)
+	priority integer DEFAULT NULL,
+	replyto varchar2 DEFAULT NULL)
 AS 'MODULE_PATHNAME','orafce_mail_send'
 LANGUAGE C;
 
@@ -24,12 +28,13 @@ CREATE PROCEDURE utl_mail.send_attach_raw(
 	bcc varchar2 DEFAULT NULL,
 	subject varchar2 DEFAULT NULL,
 	message varchar2 DEFAULT NULL,
-	mime_type varchar2 DEFAULT 'text/plain',
+	mime_type varchar2 DEFAULT NULL,
 	priority integer DEFAULT NULL,
 	attachment bytea DEFAULT NULL,
 	att_inline boolean DEFAULT true,
 	att_mime_type varchar2 DEFAULT 'application/octet',
-	att_filename varchar2 DEFAULT NULL)
+	att_filename varchar2 DEFAULT NULL,
+	replyto varchar2 DEFAULT NULL)
 AS 'MODULE_PATHNAME','orafce_mail_send_attach_raw'
 LANGUAGE C;
 
@@ -40,12 +45,13 @@ CREATE PROCEDURE utl_mail.send_attach_varchar2(
 	bcc varchar2 DEFAULT NULL,
 	subject varchar2 DEFAULT NULL,
 	message varchar2 DEFAULT NULL,
-	mime_type varchar2 DEFAULT 'text/plain',
+	mime_type varchar2 DEFAULT NULL,
 	priority integer DEFAULT NULL,
 	attachment varchar2 DEFAULT NULL,
 	att_inline boolean DEFAULT true,
-	att_mime_type varchar2 DEFAULT NULL,
-	att_filename varchar2 DEFAULT NULL)
+	att_mime_type varchar2 DEFAULT 'application/octet',
+	att_filename varchar2 DEFAULT NULL,
+	replyto varchar2 DEFAULT NULL)
 AS 'MODULE_PATHNAME','orafce_mail_send_attach_raw'
 LANGUAGE C;
 
