@@ -7,7 +7,7 @@ env:
   - PGVERSION=13
 
 language: C
-dist: xenial
+dist: bionic
 sudo: required
 
 addons:
