@@ -1,5 +1,3 @@
-[![Build Status](https://travis-ci.org/okbob/orafce_utl_mail.svg?branch=master)](https://travis-ci.org/okbob/orafce_utl_mail)
-
 # orafce_mail
 
 This is implementation of Oracle's API of packages utl_mail, DBMS_MAIL
