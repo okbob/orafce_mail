@@ -28,20 +28,6 @@ Oid		ORAFCE_MAIL_ROLE_USE = InvalidOid;
 Oid		ORAFCE_MAIL_ROLE_CONFIG_URL = InvalidOid;
 Oid		ORAFCE_MAIL_ROLE_CONFIG_USERPWD = InvalidOid;
 
-
-/*
-
-    CREATE ROLE orafce_mail NOLOGIN;
-  END IF;
-  IF NOT EXISTS(SELECT * FROM pg_roles WHERE rolname = 'orafce_mail_config_url') THEN
-    CREATE ROLE orafce_mail_config_url NOLOGIN;
-  END IF;
-  IF NOT EXISTS(SELECT * FROM pg_roles WHERE rolname = 'orafce_mail_config_userpwd') THEN
-    CREATE ROLE orafce_mail_config_userpwd NOLOGIN;
-  END IF;
-
-*/
-
 typedef struct
 {
 	char	   *header_data;
@@ -85,7 +71,6 @@ check_priv_of_role(Oid *oidptr, char *rolname)
 		*oidptr = get_role_oid(rolname, false);
 
 	return has_privs_of_role(GetUserId(), *oidptr);
-	//ACL_ID_PUBLIC
 }
 
 
@@ -975,6 +960,44 @@ orafce_mail_dbms_mail_send(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+static bool
+smtp_server_url_acl_check(char **newval, void **extra, GucSource source)
+{
+	(void) newval;
+	(void) extra;
+	(void) source;
+
+	if (!check_priv_of_role(&ORAFCE_MAIL_ROLE_CONFIG_URL,
+							"orafce_mail_config_url"))
+	{
+		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
+		GUC_check_errmsg("must be a member of the role \"orafce_mail_config_url\"");
+
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+smtp_server_userpwd_acl_check(char **newval, void **extra, GucSource source)
+{
+	(void) newval;
+	(void) extra;
+	(void) source;
+
+	if (!check_priv_of_role(&ORAFCE_MAIL_ROLE_CONFIG_USERPWD,
+							"orafce_mail_config_userpwd"))
+	{
+		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
+		GUC_check_errmsg("must be a member of the role \"orafce_mail_config_userpwd\"");
+
+		return false;
+	}
+
+	return true;
+}
+
 void
 _PG_init(void)
 {
@@ -986,7 +1009,7 @@ _PG_init(void)
 									NULL,
 									PGC_USERSET,
 									0,
-									NULL,
+									smtp_server_url_acl_check,
 									NULL, NULL);
 
 	DefineCustomStringVariable("orafce_mail.smtp_server_userpwd",
@@ -996,7 +1019,8 @@ _PG_init(void)
 									NULL,
 									PGC_USERSET,
 									0,
-									NULL, NULL, NULL);
+									smtp_server_userpwd_acl_check,
+									NULL, NULL);
 
 	EmitWarningsOnPlaceholders("orafce_mail");
 
