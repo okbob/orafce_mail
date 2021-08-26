@@ -490,7 +490,9 @@ orafce_send_mail(char *sender,
 			if (strncmp(orafce_smtp_url, "smtps://", 8) == 0)
 				(void) curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_ALL);
 
+#if LIBCURL_VERSION_NUM >= 0x074500 /* 7.69.0 */
 			(void) curl_easy_setopt(curl, CURLOPT_MAIL_RCPT_ALLLOWFAILS, 1L);
+#endif
 
 			OOM_CHECK(curl_easy_setopt(curl, CURLOPT_MAIL_FROM, sender));
 
